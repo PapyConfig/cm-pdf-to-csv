@@ -1,0 +1,26 @@
+[project]
+name = "cm-pdf-to-csv"
+version = "0.1.0"
+description = "Converts Credit Mutuel bank statement PDFs to structured transactions (CSV/JSON), ready for Securo import."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    "credit_mutuel_pdf_extractor>=0.1.0",
+    "pydantic>=2.6",
+]
+
+[project.scripts]
+cm-pdf-to-csv = "cm_pdf_to_csv.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cm_pdf_to_csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

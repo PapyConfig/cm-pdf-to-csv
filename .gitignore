@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+extrait*.pdf
+out.json
+*.csv
+!tests/data/*.csv
