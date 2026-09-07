@@ -5,6 +5,7 @@ validation de soldes) et expose une API HTTP simple, consommable par n8n.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -14,13 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("cm_pdf_to_csv")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="cm-pdf-to-csv", version="0.1.0")
+app = FastAPI(title="cm-pdf-to-csv", version="0.2.0")
 
 CMUT_BIN = os.environ.get("CMUT_BIN", "cmut_process_pdf")
 
@@ -44,6 +45,11 @@ def _run_cmut(pdf_bytes: bytes) -> list[dict[str, Any]]:
         )
         if proc.returncode != 0:
             raise HTTPException(status_code=422, detail=f"Parsing failed: {proc.stderr[-1000:]}")
+        if not out.exists():
+            raise HTTPException(
+                status_code=422,
+                detail=f"Parseur n'a rien produit. stdout: {proc.stdout[-500:]} stderr: {proc.stderr[-500:]}",
+            )
         return json.loads(out.read_text())
 
 
@@ -169,6 +175,26 @@ def _securo_base() -> str:
     return base.rstrip("/")
 
 
+def _build_import_payload(acc_txs: list[dict[str, Any]], account_id: str, filename: str) -> dict:
+    """Construit le payload d'import Securo (TransactionImportRequest)."""
+    txs = []
+    for t in acc_txs:
+        amt = float(t["amount"])
+        txs.append({
+            "description": t["description"],
+            "amount": str(abs(amt)),
+            "date": t["date"],
+            "type": "debit" if amt < 0 else "credit",
+        })
+    return {
+        "account_id": account_id,
+        "transactions": txs,
+        "filename": filename,
+        "detected_format": "csv",
+        "detect_duplicates": True,
+    }
+
+
 def _securo_token(base: str) -> str:
     """Token d'accès Securo (OAuth2 password flow)."""
     email = os.environ.get("SECURO_EMAIL", "support@rohmes.fr")
@@ -180,6 +206,74 @@ def _securo_token(base: str) -> str:
     )
     r.raise_for_status()
     return r.json()["access_token"]
+
+
+async def _securo_import_bytes(data: bytes, filename: str, base: str) -> dict:
+    """Parse un PDF puis importe les transactions dans Securo (commit)."""
+    raw = _run_cmut(data)
+    resp = _build_response(raw)
+    account_map = _load_account_map()
+
+    token = _securo_token(base)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    results, errors = [], []
+    async with httpx.AsyncClient(timeout=90) as client:
+        for acc in resp["accounts"]:
+            acc_no = acc["account"]
+            account_id = account_map.get(acc_no)
+            if not account_id:
+                errors.append({"account": acc_no, "error": "no account_id mapping"})
+                continue
+            payload = _build_import_payload(acc["transactions"], account_id, filename)
+            r = await client.post(f"{base}/api/transactions/import", headers=headers, json=payload)
+            if r.status_code not in (200, 201):
+                errors.append({"account": acc_no, "status": r.status_code, "error": r.text[:500]})
+            else:
+                body = r.json()
+                results.append({"account": acc_no, "account_id": account_id, **body})
+
+    return {"results": results, "errors": errors}
+
+
+@app.post("/api/securo/import")
+async def securo_import(file: UploadFile = File(...)):
+    """Parse le PDF (multipart) puis importe dans Securo (commit)."""
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="Aucun contenu reçu")
+    result = await _securo_import_bytes(data, file.filename or "extrait.pdf", _securo_base())
+    return JSONResponse(result)
+
+
+@app.post("/api/securo/import/raw")
+async def securo_import_raw(request: Request):
+    """Import depuis un PDF envoyé en body brut (Content-Type: application/pdf)."""
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=422, detail="Empty body")
+    result = await _securo_import_bytes(data, "cm_raw.pdf", _securo_base())
+    return JSONResponse(result)
+
+
+@app.post("/api/securo/import/base64")
+async def securo_import_base64(payload: dict):
+    """Import depuis un PDF encodé en base64 dans un JSON: {"filename", "data"}.
+
+    Chemin privilégié par n8n (formulaire) : le runner JS ne sait envoyer
+    ni multipart ni binaire brut proprement, mais le JSON/base64 est trivial.
+    """
+    data_b64 = payload.get("data") or payload.get("file")
+    filename = payload.get("filename", "extrait.pdf")
+    if not data_b64:
+        raise HTTPException(status_code=422, detail="Champ 'data' (base64) manquant")
+    try:
+        data = base64.b64decode(data_b64)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Base64 invalide: {e}")
+    if not data:
+        raise HTTPException(status_code=422, detail="Contenu vide après décodage")
+    return await _securo_import_bytes(data, filename, base_url := _securo_base())
 
 
 @app.get("/api/health")
