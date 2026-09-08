@@ -195,8 +195,26 @@ def _build_import_payload(acc_txs: list[dict[str, Any]], account_id: str, filena
     }
 
 
+_SECURO_TOKEN_CACHE: dict[str, str] = {}
+_SECURO_TOKEN_EXPIRY: dict[str, float] = {}
+# JWT OAuth2 Securo — purge courte (Securo rate-limite /api/auth/login, 429 en rafale).
+# Un login toutes les ~600s max, même avec N imports simultanés.
+_SECURO_TOKEN_TTL: float = float(os.environ.get("SECURO_TOKEN_TTL", "600"))
+
+
 def _securo_token(base: str) -> str:
-    """Token d'accès Securo (OAuth2 password flow)."""
+    """Token d'accès Securo (OAuth2 password flow), avec cache anti-rate-limit.
+
+    Plusieurs imports concurrents (multi-PDF via n8n) partagent le même token :
+    sans cache, chaque appel fait un login → Securo répond 429 Too Many Requests.
+    """
+    import time
+
+    now = time.time()
+    cached = _SECURO_TOKEN_CACHE.get(base)
+    if cached and _SECURO_TOKEN_EXPIRY.get(base, 0.0) > now:
+        return cached
+
     email = os.environ.get("SECURO_EMAIL", "support@rohmes.fr")
     password = os.environ.get("SECURO_PASSWORD", "L4GP4f&YN0mIfl")
     r = httpx.post(
@@ -205,7 +223,16 @@ def _securo_token(base: str) -> str:
         timeout=30,
     )
     r.raise_for_status()
-    return r.json()["access_token"]
+    token = r.json()["access_token"]
+    _SECURO_TOKEN_CACHE[base] = token
+    _SECURO_TOKEN_EXPIRY[base] = time.time() + _SECURO_TOKEN_TTL
+    return token
+
+
+def _securo_token_reset(base: str) -> None:
+    """Force le renouvellement du token après un 401 (expiration réelle)."""
+    _SECURO_TOKEN_CACHE.pop(base, None)
+    _SECURO_TOKEN_EXPIRY.pop(base, None)
 
 
 async def _securo_import_bytes(data: bytes, filename: str, base: str) -> dict:
@@ -227,6 +254,11 @@ async def _securo_import_bytes(data: bytes, filename: str, base: str) -> dict:
                 continue
             payload = _build_import_payload(acc["transactions"], account_id, filename)
             r = await client.post(f"{base}/api/transactions/import", headers=headers, json=payload)
+            if r.status_code == 401:
+                # Token expiré (TTL cache dépassé mais JWT déjà mort) → renew + retry une fois
+                _securo_token_reset(base)
+                headers = {"Authorization": f"Bearer {_securo_token(base)}", "Content-Type": "application/json"}
+                r = await client.post(f"{base}/api/transactions/import", headers=headers, json=payload)
             if r.status_code not in (200, 201):
                 errors.append({"account": acc_no, "status": r.status_code, "error": r.text[:500]})
             else:
